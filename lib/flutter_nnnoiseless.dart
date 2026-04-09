@@ -1,6 +1,8 @@
-import 'package:flutter/foundation.dart';
+import 'dart:io';
+
 import 'package:flutter_nnnoiseless/src/rust/api/nnnoiseless.dart';
 import 'package:flutter_nnnoiseless/src/rust/frb_generated.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:wav/wav_file.dart';
 
 /// A Dart interface for the nnnoiseless Rust library.
@@ -49,11 +51,18 @@ class _NoiselessImpl extends Noiseless {
 
   /// Initializes the underlying Rust library if it hasn't been already.
   Future<void> init() async {
-    if (!RustLib.instance.initialized) {
-      _initialized = true;
-      await RustLib.init();
-    }
+  if (!RustLib.instance.initialized) {
+    _initialized = true;
+    await RustLib.init(
+      // externalLibrary: Platform.isIOS
+          // ? ExternalLibrary.open(
+              // iKnowHowToUseIt: true,
+              // debugInfo: 'iOS uses statically linked Rust library',
+            // )
+          // : null,
+    );
   }
+}
 
   @override
   Future<void> denoiseFile({
