@@ -54,12 +54,12 @@ class _NoiselessImpl extends Noiseless {
   if (!RustLib.instance.initialized) {
     _initialized = true;
     await RustLib.init(
-      // externalLibrary: Platform.isIOS
-          // ? ExternalLibrary.open(
-              // iKnowHowToUseIt: true,
-              // debugInfo: 'iOS uses statically linked Rust library',
-            // )
-          // : null,
+      externalLibrary: Platform.isIOS
+          ? ExternalLibrary.process(
+              iKnowHowToUseIt: true,
+              debugInfo: 'iOS uses statically linked Rust library',
+            )
+          : null,
     );
   }
 }
