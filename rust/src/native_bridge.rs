@@ -25,6 +25,7 @@ fn ensure_denoisers(state: &mut CaptureState, channels: usize) {
         .collect();
 }
 
+#[cfg(target_os = "android")]
 pub fn process_interleaved_i16_in_place(
     samples: &mut [i16],
     frame_count: usize,
