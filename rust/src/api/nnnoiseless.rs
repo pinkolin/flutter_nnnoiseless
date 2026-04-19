@@ -7,20 +7,10 @@ use nnnoiseless::{DenoiseState, RnnModel};
 use once_cell::sync::Lazy;
 use std::path::Path;
 use std::sync::Mutex;
-use std::f32::consts::PI;
-
 /// The fixed frame size required by the nnnoiseless model.
 const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
-const HOP_SIZE: usize = FRAME_SIZE / 2;
 /// The target sample rate the model is trained for.
 const TARGET_SAMPLE_RATE: u32 = 48000;
-
-/// Generates a Hann window for smoothing audio frames.
-fn hann_window(len: usize) -> Vec<f32> {
-    (0..len)
-        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (len - 1) as f32).cos()))
-        .collect()
-}
 
 // This struct holds the state required for real-time processing.
 struct DenoiseRealtimeState {
