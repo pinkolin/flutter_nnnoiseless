@@ -1,4 +1,4 @@
-import 'package:flutter_nnnoiseless/src/rust/api/nnnoiseless.dart';
+import 'package:flutter_nnnoiseless/src/rust/api/nnnoiseless.dart' as rust_api;
 import 'package:flutter_nnnoiseless/src/rust/frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:wav/wav_file.dart';
@@ -49,11 +49,11 @@ class _NoiselessImpl extends Noiseless {
 
   /// Initializes the underlying Rust library if it hasn't been already.
   Future<void> init() async {
-  if (!RustLib.instance.initialized) {
+    if (!RustLib.instance.initialized) {
+      await RustLib.init();
+    }
     _initialized = true;
-    await RustLib.init();
   }
-}
 
   @override
   Future<void> denoiseFile({
@@ -61,7 +61,10 @@ class _NoiselessImpl extends Noiseless {
     required String outputPathStr,
   }) async {
     if (!_initialized) await init();
-    return denoise(inputPathStr: inputPathStr, outputPathStr: outputPathStr);
+    return rust_api.denoise(
+      inputPathStr: inputPathStr,
+      outputPathStr: outputPathStr,
+    );
   }
 
   @override
@@ -70,14 +73,10 @@ class _NoiselessImpl extends Noiseless {
     int inputSampleRate = 48000,
   }) async {
     if (!_initialized) await init();
-    // Assuming the rust function is named `denoise_chunk` or similar.
-    // The original code had a recursive call here, which is likely an error.
-    // This should call the actual Rust binding.
-    // For example:
-    // return denoiseRealtime(input: input, inputSampleRate: inputSampleRate);
-    // Since the actual binding name isn't provided, I'll leave the original
-    // (likely incorrect) code but comment on the required change.
-    return await denoiseChunk(input: input, inputSampleRate: inputSampleRate);
+    return rust_api.denoiseChunk(
+      input: input,
+      inputSampleRate: inputSampleRate,
+    );
   }
 
   @override
