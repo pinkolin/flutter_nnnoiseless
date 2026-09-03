@@ -25,64 +25,6 @@ fn ensure_denoisers(state: &mut CaptureState, channels: usize) {
         .collect();
 }
 
-#[cfg(target_os = "android")]
-pub fn process_interleaved_i16_in_place(
-    samples: &mut [i16],
-    frame_count: usize,
-    channels: usize,
-    sample_rate: u32,
-) -> bool {
-    if samples.is_empty() {
-        return true;
-    }
-
-    if sample_rate != TARGET_SAMPLE_RATE || channels == 0 {
-        return false;
-    }
-
-    if frame_count < FRAME_SIZE {
-        return true;
-    }
-
-    let required_len = frame_count.saturating_mul(channels);
-    if samples.len() < required_len {
-        return false;
-    }
-
-    let blocks = frame_count / FRAME_SIZE;
-    let mut state = match CAPTURE_STATE.lock() {
-        Ok(state) => state,
-        Err(_) => return false,
-    };
-
-    ensure_denoisers(&mut state, channels);
-
-    let mut input_frame = vec![0.0f32; FRAME_SIZE];
-    let mut output_frame = vec![0.0f32; FRAME_SIZE];
-
-    for channel in 0..channels {
-        for block in 0..blocks {
-            let frame_offset = block * FRAME_SIZE;
-
-            for idx in 0..FRAME_SIZE {
-                let interleaved_index = (frame_offset + idx) * channels + channel;
-                input_frame[idx] = samples[interleaved_index] as f32;
-            }
-
-            state.denoisers[channel].process_frame(&mut output_frame, &input_frame);
-
-            for idx in 0..FRAME_SIZE {
-                let interleaved_index = (frame_offset + idx) * channels + channel;
-                samples[interleaved_index] = output_frame[idx]
-                    .round()
-                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            }
-        }
-    }
-
-    true
-}
-
 pub fn reset_capture_state() {
     if let Ok(mut state) = CAPTURE_STATE.lock() {
         state.denoisers.clear();
@@ -164,8 +106,8 @@ pub unsafe extern "C" fn ketska_nnnoiseless_process_f32_channel(
 
 #[cfg(target_os = "android")]
 mod android {
-    use super::{process_interleaved_i16_in_place, reset_capture_state};
-    use jni::objects::{JClass, JShortArray};
+    use super::{process_f32_channel_in_place, reset_capture_state};
+    use jni::objects::{JClass, JFloatArray};
     use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
     use jni::JNIEnv;
 
@@ -177,16 +119,21 @@ mod android {
         reset_capture_state();
     }
 
+    /// WebRTC's Android capture post-processing hook (webrtc-sdk
+    /// `ExternalAudioProcessor::Process`) hands the app `audio->channels()[0]`:
+    /// the FULL-BAND mono signal as float32 in PCM16 amplitude space (±32768),
+    /// `num_frames` samples per 10 ms. `num_bands` is informational only (it
+    /// sizes the buffer: 160 × bands = frames); the data is never band-split.
+    /// One 10 ms block at 48 kHz is exactly one RNNoise frame (480 samples).
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeProcessCaptureBuffer(
-        mut env: JNIEnv,
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeProcessCaptureFloatBuffer(
+        env: JNIEnv,
         _class: JClass,
-        samples: JShortArray,
+        samples: JFloatArray,
         frame_count: jint,
-        channel_count: jint,
         sample_rate: jint,
     ) -> jboolean {
-        if frame_count <= 0 || channel_count <= 0 || sample_rate <= 0 {
+        if frame_count <= 0 || sample_rate <= 0 {
             return JNI_FALSE;
         }
 
@@ -194,21 +141,20 @@ mod android {
             Ok(value) => value as usize,
             Err(_) => return JNI_FALSE,
         };
-
-        let mut buffer = vec![0i16; len];
-        if env.get_short_array_region(&samples, 0, &mut buffer).is_err() {
+        let frames = (frame_count as usize).min(len);
+        if frames == 0 {
             return JNI_FALSE;
         }
 
-        let processed = process_interleaved_i16_in_place(
-            &mut buffer,
-            frame_count as usize,
-            channel_count as usize,
-            sample_rate as u32,
-        );
+        let mut buffer = vec![0.0f32; frames];
+        if env.get_float_array_region(&samples, 0, &mut buffer).is_err() {
+            return JNI_FALSE;
+        }
+
+        let processed = process_f32_channel_in_place(&mut buffer, sample_rate as u32, 0);
 
         if processed {
-            if env.set_short_array_region(&samples, 0, &buffer).is_err() {
+            if env.set_float_array_region(&samples, 0, &buffer).is_err() {
                 return JNI_FALSE;
             }
             JNI_TRUE
