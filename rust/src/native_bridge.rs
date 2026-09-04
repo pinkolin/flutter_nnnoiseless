@@ -35,7 +35,18 @@ struct VoxGate {
     mid_pos: usize,
     mid_filled: usize,
     mid_count: u32,
+    /// Early verdict after opening: frames and unsure frames since the gate
+    /// opened. The rolling window is full of *silence* (not unsure) when a
+    /// sound starts, so music got 1–3 s on air before the 2 s window caught
+    /// it. Speech goes to ≥ 0.9 right at onset; music wanders the mid zone.
+    since_open: u32,
+    mid_since_open: u32,
 }
+
+/// Frames after opening before the early verdict is taken (300 ms) …
+const EARLY_FRAMES: u32 = 30;
+/// … and the unsure share since opening that closes the gate (music).
+const EARLY_CLOSE_MIN: f32 = 0.40;
 
 /// 2 s of 10 ms frames. Second field round (2026-09-04): with a 1 s window and
 /// 0.25/0.35 the guard chopped confident speech at word boundaries (bursts
@@ -68,6 +79,8 @@ impl VoxGate {
             mid_pos: 0,
             mid_filled: 0,
             mid_count: 0,
+            since_open: 0,
+            mid_since_open: 0,
         }
     }
 
@@ -81,6 +94,8 @@ impl VoxGate {
         self.mid_pos = 0;
         self.mid_filled = 0;
         self.mid_count = 0;
+        self.since_open = 0;
+        self.mid_since_open = 0;
     }
 
     /// Share of "unsure" frames (MID_LOW..MID_HIGH) in the last second.
@@ -113,6 +128,16 @@ impl VoxGate {
         self.hist[bin] = self.hist[bin].saturating_add(1);
         self.push_mid(prob);
         let mid_ratio = self.mid_ratio();
+        let is_mid = prob >= MID_LOW && prob < MID_HIGH;
+        if self.open {
+            self.since_open = self.since_open.saturating_add(1);
+            if is_mid {
+                self.mid_since_open = self.mid_since_open.saturating_add(1);
+            }
+        }
+        let early_music = self.open
+            && self.since_open >= EARLY_FRAMES
+            && (self.mid_since_open as f32 / self.since_open as f32) > EARLY_CLOSE_MIN;
         if prob >= self.open_thr {
             self.above = self.above.saturating_add(1);
             self.below = 0;
@@ -126,11 +151,14 @@ impl VoxGate {
         }
         if !self.open && self.above >= self.attack_frames && mid_ratio <= MID_OPEN_MAX {
             self.open = true;
+            self.since_open = 0;
+            self.mid_since_open = 0;
             self.transitions += 1;
         } else if self.open
             && (self.below >= self.hangover_frames
                 || self.since_high >= self.hangover_frames.saturating_mul(2).max(1)
-                || mid_ratio > MID_CLOSE_MIN)
+                || mid_ratio > MID_CLOSE_MIN
+                || early_music)
         {
             self.open = false;
             self.below = 0;
