@@ -41,7 +41,17 @@ struct VoxGate {
     /// it. Speech goes to ≥ 0.9 right at onset; music wanders the mid zone.
     since_open: u32,
     mid_since_open: u32,
+    /// Re-open block after a music close (frames). Field round 4: music with
+    /// dynamics chattered in 300 ms blips because nothing stopped the next
+    /// onset. Doubles per consecutive music close, a normal close resets it.
+    block_frames: u32,
+    music_streak: u32,
 }
+
+/// Re-open block after the first music close (1 s) …
+const MUSIC_BLOCK_BASE: u32 = 100;
+/// … doubling per consecutive music close up to this (8 s).
+const MUSIC_BLOCK_MAX: u32 = 800;
 
 /// Frames after opening before the early verdict is taken (300 ms) …
 const EARLY_FRAMES: u32 = 30;
@@ -81,6 +91,8 @@ impl VoxGate {
             mid_count: 0,
             since_open: 0,
             mid_since_open: 0,
+            block_frames: 0,
+            music_streak: 0,
         }
     }
 
@@ -96,6 +108,8 @@ impl VoxGate {
         self.mid_count = 0;
         self.since_open = 0;
         self.mid_since_open = 0;
+        self.block_frames = 0;
+        self.music_streak = 0;
     }
 
     /// Share of "unsure" frames (MID_LOW..MID_HIGH) in the last second.
@@ -138,6 +152,9 @@ impl VoxGate {
         let early_music = self.open
             && self.since_open >= EARLY_FRAMES
             && (self.mid_since_open as f32 / self.since_open as f32) > EARLY_CLOSE_MIN;
+        if self.block_frames > 0 {
+            self.block_frames -= 1;
+        }
         if prob >= self.open_thr {
             self.above = self.above.saturating_add(1);
             self.below = 0;
@@ -149,20 +166,31 @@ impl VoxGate {
                 self.below = self.below.saturating_add(1);
             }
         }
-        if !self.open && self.above >= self.attack_frames && mid_ratio <= MID_OPEN_MAX {
+        if !self.open
+            && self.above >= self.attack_frames
+            && mid_ratio <= MID_OPEN_MAX
+            && self.block_frames == 0
+        {
             self.open = true;
             self.since_open = 0;
             self.mid_since_open = 0;
             self.transitions += 1;
-        } else if self.open
-            && (self.below >= self.hangover_frames
-                || self.since_high >= self.hangover_frames.saturating_mul(2).max(1)
-                || mid_ratio > MID_CLOSE_MIN
-                || early_music)
-        {
-            self.open = false;
-            self.below = 0;
-            self.transitions += 1;
+        } else if self.open {
+            let music_close = mid_ratio > MID_CLOSE_MIN || early_music;
+            let normal_close = self.below >= self.hangover_frames
+                || self.since_high >= self.hangover_frames.saturating_mul(2).max(1);
+            if music_close || normal_close {
+                self.open = false;
+                self.below = 0;
+                self.transitions += 1;
+                if music_close {
+                    self.block_frames =
+                        (MUSIC_BLOCK_BASE << self.music_streak.min(3)).min(MUSIC_BLOCK_MAX);
+                    self.music_streak = self.music_streak.saturating_add(1);
+                } else {
+                    self.music_streak = 0;
+                }
+            }
         }
         self.open
     }
