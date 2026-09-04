@@ -27,7 +27,23 @@ struct VoxGate {
     /// Speech-probability histogram (10 bins of 0.1) over frames seen while the
     /// gate is enabled — diagnostics to tell music from speech in the field.
     hist: [u32; 10],
+    /// Music guard. Field data (Pixel 9, 2026-09-04): RNNoise is *confident* on
+    /// speech (frames sit near 0 or near 1, ~5 % in 0.2..0.8) and *unsure* on
+    /// instrumental music (~57 % of frames in 0.2..0.8). Ring of the last
+    /// MID_WINDOW frames: 1 = probability in the mid zone.
+    mid_ring: [u8; MID_WINDOW],
+    mid_pos: usize,
+    mid_filled: usize,
+    mid_count: u32,
 }
+
+const MID_WINDOW: usize = 100; // 1 s of 10 ms frames
+const MID_LOW: f32 = 0.2;
+const MID_HIGH: f32 = 0.8;
+/// The gate may not open while more than this share of the last second is unsure.
+const MID_OPEN_MAX: f32 = 0.25;
+/// An open gate closes once the unsure share climbs above this (music started).
+const MID_CLOSE_MIN: f32 = 0.35;
 
 impl VoxGate {
     const fn new() -> Self {
@@ -44,6 +60,10 @@ impl VoxGate {
             last_prob: 0.0,
             transitions: 0,
             hist: [0; 10],
+            mid_ring: [0; MID_WINDOW],
+            mid_pos: 0,
+            mid_filled: 0,
+            mid_count: 0,
         }
     }
 
@@ -53,6 +73,29 @@ impl VoxGate {
         self.below = 0;
         self.since_high = 0;
         self.last_prob = 0.0;
+        self.mid_ring = [0; MID_WINDOW];
+        self.mid_pos = 0;
+        self.mid_filled = 0;
+        self.mid_count = 0;
+    }
+
+    /// Share of "unsure" frames (MID_LOW..MID_HIGH) in the last second.
+    fn mid_ratio(&self) -> f32 {
+        if self.mid_filled == 0 {
+            return 0.0;
+        }
+        self.mid_count as f32 / self.mid_filled as f32
+    }
+
+    fn push_mid(&mut self, prob: f32) {
+        let is_mid: u8 = if prob >= MID_LOW && prob < MID_HIGH { 1 } else { 0 };
+        let old = self.mid_ring[self.mid_pos];
+        self.mid_ring[self.mid_pos] = is_mid;
+        self.mid_count = self.mid_count + is_mid as u32 - old as u32;
+        self.mid_pos = (self.mid_pos + 1) % MID_WINDOW;
+        if self.mid_filled < MID_WINDOW {
+            self.mid_filled += 1;
+        }
     }
 
     /// Feed one frame's speech probability; returns whether the gate is open
@@ -64,6 +107,8 @@ impl VoxGate {
         }
         let bin = ((prob.clamp(0.0, 1.0) * 10.0) as usize).min(9);
         self.hist[bin] = self.hist[bin].saturating_add(1);
+        self.push_mid(prob);
+        let mid_ratio = self.mid_ratio();
         if prob >= self.open_thr {
             self.above = self.above.saturating_add(1);
             self.below = 0;
@@ -75,12 +120,13 @@ impl VoxGate {
                 self.below = self.below.saturating_add(1);
             }
         }
-        if !self.open && self.above >= self.attack_frames {
+        if !self.open && self.above >= self.attack_frames && mid_ratio <= MID_OPEN_MAX {
             self.open = true;
             self.transitions += 1;
         } else if self.open
             && (self.below >= self.hangover_frames
-                || self.since_high >= self.hangover_frames.saturating_mul(2).max(1))
+                || self.since_high >= self.hangover_frames.saturating_mul(2).max(1)
+                || mid_ratio > MID_CLOSE_MIN)
         {
             self.open = false;
             self.below = 0;
@@ -122,6 +168,10 @@ pub fn vox_gate_last_prob() -> f32 {
 
 pub fn vox_gate_transitions() -> u64 {
     CAPTURE_STATE.lock().map(|s| s.gate.transitions).unwrap_or(0)
+}
+
+pub fn vox_gate_mid_ratio() -> f32 {
+    CAPTURE_STATE.lock().map(|s| s.gate.mid_ratio()).unwrap_or(0.0)
 }
 
 /// Copy of the probability histogram; `reset` clears it afterwards.
@@ -267,6 +317,11 @@ pub extern "C" fn ketska_nnnoiseless_vox_gate_transitions() -> u64 {
     vox_gate_transitions()
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ketska_nnnoiseless_vox_gate_mid_ratio() -> f32 {
+    vox_gate_mid_ratio()
+}
+
 /// Writes up to `len` histogram bins into `out`; returns the number written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ketska_nnnoiseless_vox_gate_hist(out: *mut u32, len: i32, reset: bool) -> i32 {
@@ -284,7 +339,7 @@ pub unsafe extern "C" fn ketska_nnnoiseless_vox_gate_hist(out: *mut u32, len: i3
 mod android {
     use super::{
         process_f32_channel_in_place, reset_capture_state, set_vox_gate, vox_gate_hist,
-        vox_gate_is_open, vox_gate_last_prob, vox_gate_transitions,
+        vox_gate_is_open, vox_gate_last_prob, vox_gate_mid_ratio, vox_gate_transitions,
     };
     use jni::objects::{JClass, JFloatArray, JIntArray};
     use jni::sys::{jboolean, jfloat, jint, jlong, JNI_FALSE, JNI_TRUE};
@@ -340,6 +395,14 @@ mod android {
         _class: JClass,
     ) -> jfloat {
         vox_gate_last_prob()
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeVoxGateMidRatio(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jfloat {
+        vox_gate_mid_ratio()
     }
 
     #[unsafe(no_mangle)]
