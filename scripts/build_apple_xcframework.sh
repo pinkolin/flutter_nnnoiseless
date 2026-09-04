@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUST_DIR="$ROOT/rust"
-OUT_DIR="$ROOT/ios/Frameworks"
+OUT_DIR="$ROOT/ios/flutter_nnnoiseless/Frameworks"  # the vendored copy CocoaPods (podspec) and SPM (Package.swift) actually ship
 TMP_DIR="$(mktemp -d)"
 LIB="rust_lib_flutter_nnnoiseless"
 
