@@ -24,6 +24,9 @@ struct VoxGate {
     since_high: u32,
     last_prob: f32,
     transitions: u64,
+    /// Speech-probability histogram (10 bins of 0.1) over frames seen while the
+    /// gate is enabled — diagnostics to tell music from speech in the field.
+    hist: [u32; 10],
 }
 
 impl VoxGate {
@@ -40,6 +43,7 @@ impl VoxGate {
             since_high: 0,
             last_prob: 0.0,
             transitions: 0,
+            hist: [0; 10],
         }
     }
 
@@ -58,6 +62,8 @@ impl VoxGate {
         if !self.enabled {
             return true;
         }
+        let bin = ((prob.clamp(0.0, 1.0) * 10.0) as usize).min(9);
+        self.hist[bin] = self.hist[bin].saturating_add(1);
         if prob >= self.open_thr {
             self.above = self.above.saturating_add(1);
             self.below = 0;
@@ -116,6 +122,20 @@ pub fn vox_gate_last_prob() -> f32 {
 
 pub fn vox_gate_transitions() -> u64 {
     CAPTURE_STATE.lock().map(|s| s.gate.transitions).unwrap_or(0)
+}
+
+/// Copy of the probability histogram; `reset` clears it afterwards.
+pub fn vox_gate_hist(reset: bool) -> [u32; 10] {
+    match CAPTURE_STATE.lock() {
+        Ok(mut s) => {
+            let h = s.gate.hist;
+            if reset {
+                s.gate.hist = [0; 10];
+            }
+            h
+        }
+        Err(_) => [0; 10],
+    }
 }
 
 fn ensure_denoisers(state: &mut CaptureState, channels: usize) {
@@ -247,15 +267,45 @@ pub extern "C" fn ketska_nnnoiseless_vox_gate_transitions() -> u64 {
     vox_gate_transitions()
 }
 
+/// Writes up to `len` histogram bins into `out`; returns the number written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ketska_nnnoiseless_vox_gate_hist(out: *mut u32, len: i32, reset: bool) -> i32 {
+    if out.is_null() || len <= 0 {
+        return 0;
+    }
+    let h = vox_gate_hist(reset);
+    let n = (len as usize).min(h.len());
+    let slice = unsafe { std::slice::from_raw_parts_mut(out, n) };
+    slice.copy_from_slice(&h[..n]);
+    n as i32
+}
+
 #[cfg(target_os = "android")]
 mod android {
     use super::{
-        process_f32_channel_in_place, reset_capture_state, set_vox_gate, vox_gate_is_open,
-        vox_gate_last_prob, vox_gate_transitions,
+        process_f32_channel_in_place, reset_capture_state, set_vox_gate, vox_gate_hist,
+        vox_gate_is_open, vox_gate_last_prob, vox_gate_transitions,
     };
-    use jni::objects::{JClass, JFloatArray};
+    use jni::objects::{JClass, JFloatArray, JIntArray};
     use jni::sys::{jboolean, jfloat, jint, jlong, JNI_FALSE, JNI_TRUE};
     use jni::JNIEnv;
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeVoxGateHist<'a>(
+        env: JNIEnv<'a>,
+        _class: JClass,
+        reset: jboolean,
+    ) -> JIntArray<'a> {
+        let h = vox_gate_hist(reset != JNI_FALSE);
+        let values: Vec<jint> = h.iter().map(|v| *v as jint).collect();
+        match env.new_int_array(values.len() as jint) {
+            Ok(arr) => {
+                let _ = env.set_int_array_region(&arr, 0, &values);
+                arr
+            }
+            Err(_) => JIntArray::default(),
+        }
+    }
 
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeSetVoxGate(
