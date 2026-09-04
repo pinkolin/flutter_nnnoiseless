@@ -44,3 +44,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# build_apple_xcframework.sh output; the shipped copy lives in ios/flutter_nnnoiseless/Frameworks
+ios/Frameworks/
