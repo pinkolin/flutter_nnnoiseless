@@ -37,13 +37,17 @@ struct VoxGate {
     mid_count: u32,
 }
 
-const MID_WINDOW: usize = 100; // 1 s of 10 ms frames
+/// 2 s of 10 ms frames. Second field round (2026-09-04): with a 1 s window and
+/// 0.25/0.35 the guard chopped confident speech at word boundaries (bursts
+/// with 70 % of frames ≥ 0.9 closed at mid=0.36–0.37). Music averages 0.57,
+/// so the separation lives in a longer window and looser thresholds.
+const MID_WINDOW: usize = 200;
 const MID_LOW: f32 = 0.2;
 const MID_HIGH: f32 = 0.8;
-/// The gate may not open while more than this share of the last second is unsure.
-const MID_OPEN_MAX: f32 = 0.25;
+/// The gate may not open while more than this share of the window is unsure.
+const MID_OPEN_MAX: f32 = 0.30;
 /// An open gate closes once the unsure share climbs above this (music started).
-const MID_CLOSE_MIN: f32 = 0.35;
+const MID_CLOSE_MIN: f32 = 0.45;
 
 impl VoxGate {
     const fn new() -> Self {
