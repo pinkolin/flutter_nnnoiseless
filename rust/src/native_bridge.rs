@@ -2,6 +2,8 @@ use nnnoiseless::{DenoiseState, RnnModel};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
+use crate::normalizer::{Normalizer, NormalizerSettings};
+
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
@@ -204,6 +206,13 @@ struct CaptureState {
 static CAPTURE_STATE: Lazy<Mutex<CaptureState>> =
     Lazy::new(|| Mutex::new(CaptureState { denoisers: Vec::new(), gate: VoxGate::new() }));
 
+/// Transmit loudness control. Deliberately NOT part of `CaptureState`: it has to
+/// run for every user, including everyone with the AI filter switched off, so it
+/// is called from a separate entry point that the bridges invoke before their
+/// bypass check. See `normalizer.rs` for why it exists.
+static NORMALIZER: Lazy<Mutex<Normalizer>> =
+    Lazy::new(|| Mutex::new(Normalizer::new(NormalizerSettings::default())));
+
 /// Configure the VOX gate. Thresholds are RNNoise speech probabilities (0..1),
 /// frame counts are 10 ms units. Disabling also closes/resets the runtime state.
 pub fn set_vox_gate(enabled: bool, open_thr: f32, close_thr: f32, attack_frames: u32, hangover_frames: u32) {
@@ -395,10 +404,82 @@ pub unsafe extern "C" fn ketska_nnnoiseless_vox_gate_hist(out: *mut u32, len: i3
     n as i32
 }
 
+/// Applies transmit loudness control to one capture block, in place.
+///
+/// Returns the gain in effect at the end of the block, or 1.0 when disabled, so
+/// the caller can report it without a second call. Safe to invoke on every
+/// block regardless of the AI filter: when disabled it leaves the samples
+/// untouched.
+pub fn normalize_f32_channel_in_place(samples: &mut [f32], sample_rate: u32) -> f32 {
+    match NORMALIZER.lock() {
+        Ok(mut normalizer) => normalizer.process(samples, sample_rate),
+        Err(_) => 1.0,
+    }
+}
+
+pub fn set_normalizer(enabled: bool, target_rms: f32, max_gain: f32) {
+    if let Ok(mut normalizer) = NORMALIZER.lock() {
+        let mut settings = normalizer.settings();
+        settings.enabled = enabled;
+        if target_rms > 0.0 {
+            settings.target_rms = target_rms;
+        }
+        if max_gain >= 1.0 {
+            settings.max_gain = max_gain;
+        }
+        normalizer.set_settings(settings);
+    }
+}
+
+pub fn reset_normalizer() {
+    if let Ok(mut normalizer) = NORMALIZER.lock() {
+        normalizer.reset();
+    }
+}
+
+pub fn normalizer_gain() -> f32 {
+    match NORMALIZER.lock() {
+        Ok(normalizer) => normalizer.current_gain(),
+        Err(_) => 1.0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ketska_normalizer_process_f32_channel(
+    samples: *mut f32,
+    frame_count: i32,
+    sample_rate: i32,
+) -> f32 {
+    if samples.is_null() || frame_count <= 0 || sample_rate <= 0 {
+        return 1.0;
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(samples, frame_count as usize) };
+    normalize_f32_channel_in_place(slice, sample_rate as u32)
+}
+
+/// `target_rms` and `max_gain` are ignored when non-positive / below 1.0, so the
+/// caller can pass 0 to keep the current value. The ceiling is NOT settable: it
+/// is the anti-clipping rail.
+#[unsafe(no_mangle)]
+pub extern "C" fn ketska_normalizer_set(enabled: bool, target_rms: f32, max_gain: f32) {
+    set_normalizer(enabled, target_rms, max_gain);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ketska_normalizer_reset() {
+    reset_normalizer();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ketska_normalizer_gain() -> f32 {
+    normalizer_gain()
+}
+
 #[cfg(target_os = "android")]
 mod android {
     use super::{
-        process_f32_channel_in_place, reset_capture_state, set_vox_gate, vox_gate_hist,
+        normalize_f32_channel_in_place, normalizer_gain, process_f32_channel_in_place,
+        reset_capture_state, reset_normalizer, set_normalizer, set_vox_gate, vox_gate_hist,
         vox_gate_is_open, vox_gate_last_prob, vox_gate_mid_ratio, vox_gate_transitions,
     };
     use jni::objects::{JClass, JFloatArray, JIntArray};
@@ -523,5 +604,72 @@ mod android {
         } else {
             JNI_FALSE
         }
+    }
+
+    /// Transmit loudness control. Returns the gain in effect at the end of the
+    /// block, so the bridge can report it in its TX stats without a second call.
+    /// Called for EVERY block, AI filter or not — see `compressor.rs`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeNormalizeCaptureFloatBuffer(
+        env: JNIEnv,
+        _class: JClass,
+        samples: JFloatArray,
+        frame_count: jint,
+        sample_rate: jint,
+    ) -> jfloat {
+        if frame_count <= 0 || sample_rate <= 0 {
+            return 1.0;
+        }
+
+        let len = match env.get_array_length(&samples) {
+            Ok(value) => value as usize,
+            Err(_) => return 1.0,
+        };
+        let frames = (frame_count as usize).min(len);
+        if frames == 0 {
+            return 1.0;
+        }
+
+        let mut buffer = vec![0.0f32; frames];
+        if env.get_float_array_region(&samples, 0, &mut buffer).is_err() {
+            return 1.0;
+        }
+
+        let gain = normalize_f32_channel_in_place(&mut buffer, sample_rate as u32);
+
+        // Only write back when the stage actually changed something; a disabled
+        // compressor must cost nothing but the read.
+        if gain != 1.0 && env.set_float_array_region(&samples, 0, &buffer).is_err() {
+            return 1.0;
+        }
+
+        gain
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeSetNormalizer(
+        _env: JNIEnv,
+        _class: JClass,
+        enabled: jboolean,
+        target_rms: jfloat,
+        max_gain: jfloat,
+    ) {
+        set_normalizer(enabled != 0, target_rms, max_gain);
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeResetNormalizer(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        reset_normalizer();
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_cz_ketska_ketska_1app_KetskaAiFilterNative_nativeNormalizerGain(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jfloat {
+        normalizer_gain()
     }
 }
